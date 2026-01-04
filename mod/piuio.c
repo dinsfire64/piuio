@@ -48,11 +48,17 @@
 #define PIUIO_NUM_EXTRA (KEY_MAX - BTN_TRIGGER_HAPPY)
 #define PIUIO_NUM_BTNS (PIUIO_NUM_REG + PIUIO_NUM_EXTRA)
 
-/* enable reactive lights for pump*/
+/* enable reactive lights for pump */
 static bool reactive_pump_lights = false;
 module_param(reactive_pump_lights, bool, 0644);
 MODULE_PARM_DESC(reactive_pump_lights,
         "Enable reactive lighting behavior for pump piuio (default: disabled)");
+
+/* enable reactive lights for itg */
+static bool reactive_itg_lights = false;
+module_param(reactive_itg_lights, bool, 0644);
+MODULE_PARM_DESC(reactive_itg_lights,
+        "Enable reactive lighting behavior for itg piuio (default: disabled)");
 
 
 /**
@@ -297,11 +303,15 @@ static void piuio_out_completed(struct urb *urb)
 	piu->outputs[2] &= ~((1 << piu->type->mplex_bits) - 1);
 	piu->outputs[2] |= piu->set;
 	
-	/* Set reactive pump lights if desired */
+	/* Set reactive lights if desired */
 	if(reactive_pump_lights) {
 		/* move inputs to lighting positions and mask to prevent overwriting the muxtiplexer */
-		piu->outputs[0] |= (~((piu->inputs[0] >> 0) & 0xFF) << 2) & 0x7C;
+		piu->outputs[0] |= (~((piu->inputs[0] >> 00) & 0xFF) << 2) & 0x7C;
 		piu->outputs[2] |= (~((piu->inputs[0] >> 16) & 0xFF) << 2) & 0x7C;
+	} else if(reactive_itg_lights) {
+		/* itg lights are mixed up between input and output (p1 input is p2 light output) */
+		piu->outputs[0] |= (~((piu->inputs[0] >> 16) & 0xFF) << 2) & 0x3C;
+		piu->outputs[2] |= (~((piu->inputs[0] >> 00) & 0xFF) << 2) & 0x3C;
 	}
 	
 	//dev_info(&piu->udev->dev, "%08x -> %02x %02x\n", piu->inputs[0], piu->outputs[0], piu->outputs[2]);
@@ -533,6 +543,8 @@ static int piuio_init(struct piuio *piu, struct input_dev *idev,
 
 	if (reactive_pump_lights) {
        dev_info(&piu->udev->dev, "piuio reactive_pump_lights enabled\n");
+	} else if(reactive_itg_lights) {
+		dev_info(&piu->udev->dev, "piuio reactive_itg_lights enabled\n");
 	}
 
 	return 0;
