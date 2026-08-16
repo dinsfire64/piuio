@@ -17,6 +17,10 @@
 #include <linux/sysfs.h>
 #include <linux/errno.h>
 #include <linux/bitops.h>
+#include <linux/fs.h>
+#include <linux/miscdevice.h>
+#include <linux/mm.h>
+#include <linux/io.h>
 #include <linux/leds.h>
 #include <linux/wait.h>
 #include <linux/jiffies.h>
@@ -87,6 +91,12 @@ struct piuio_devtype {
 	int mplex_bits;
 };
 
+// state to be given to userland that contains the whole message structure.
+struct piu_shared_state {
+    unsigned long inputs[4][PIUIO_MSG_LONGS];
+};
+
+
 /**
  * struct piuio - state of each attached PIUIO
  * @type:	Type of PIUIO device (currently either full or buttonboard)
@@ -122,6 +132,11 @@ struct piuio {
 	unsigned long inputs[PIUIO_MSG_LONGS];
 	unsigned char outputs[PIUIO_MSG_SZ];
 	unsigned char new_outputs[PIUIO_MSG_SZ];
+
+	// for sending to userland
+	struct piu_shared_state *shared_state;
+	// for the creation of our character device.
+	struct miscdevice miscdev;
 
 	struct piuio_led *led;
 
@@ -241,6 +256,13 @@ static void piuio_in_completed(struct urb *urb)
 
 	/* Get the index of the previous input set (always 0 if no multiplexer) */
 	cur_set = (piu->set + piu->type->mplex - 1) % piu->type->mplex;
+
+	// copy the current input set to the full shared state in its index.
+	memcpy(
+		&piu->shared_state->inputs[cur_set][0],
+		&piu->inputs[0],
+		PIUIO_MSG_SZ
+	);
 
 	/* Note what has changed in this input set, then store the inputs for
 	 * next time */
@@ -444,7 +466,7 @@ static void piuio_input_init(struct piuio *piu, struct device *parent)
 static int piuio_leds_init(struct piuio *piu)
 {
 	int i;
-	const struct attribute_group **ag;
+	const struct attribute_group * const *ag;
 	struct attribute **attr;
 	int ret;
 
@@ -491,6 +513,13 @@ static int piuio_init(struct piuio *piu, struct input_dev *idev,
 {
 	/* Note: if this function returns an error, piuio_destroy will still be
 	 * called, so we don't need to clean up here */
+
+	//allocate a page of memory to be shared with userland so we can give it the full message.
+	piu->shared_state = (void *)get_zeroed_page(GFP_KERNEL);
+
+	if (!piu->shared_state) {
+		return -ENOMEM;
+	}
 
 	/* Allocate USB request blocks */
 	piu->in = usb_alloc_urb(0, GFP_KERNEL);
@@ -558,7 +587,53 @@ static void piuio_destroy(struct piuio *piu)
 	kfree(piu->old_inputs);
 	usb_free_urb(piu->out);
 	usb_free_urb(piu->in);
+	free_page((unsigned long)piu->shared_state);
 }
+
+/*
+ * Character device management for full state reading.
+ */
+static int piufullstate_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    struct piuio *piu = file->private_data;
+    unsigned long size = vma->vm_end - vma->vm_start;
+
+    if (size > PAGE_SIZE)
+        return -EINVAL;
+
+    return remap_pfn_range(
+        vma,
+        vma->vm_start,
+        virt_to_phys(piu->shared_state) >> PAGE_SHIFT,
+        PAGE_SIZE,
+        vma->vm_page_prot
+    );
+}
+
+static int piufullstate_open(struct inode *inode, struct file *file)
+{
+	struct miscdevice *miscdev = file->private_data;
+    struct piuio *piu;
+
+    piu = container_of(miscdev, struct piuio, miscdev);
+
+    file->private_data = piu;
+
+    return 0;
+}
+
+static int piufullstate_release(struct inode *inode, struct file *file)
+{
+	//nothing needs to be done when the userland closes the file
+    return 0;
+}
+
+static const struct file_operations piu_fops = {
+    .owner = THIS_MODULE,
+    .open = piufullstate_open,
+    .release = piufullstate_release,
+    .mmap = piufullstate_mmap,
+};
 
 
 /*
@@ -576,6 +651,20 @@ static int piuio_probe(struct usb_interface *intf,
 	piu = kzalloc(sizeof(struct piuio), GFP_KERNEL);
 	if (!piu) {
 		dev_err(&intf->dev, "piuio probe: failed to allocate state\n");
+		return ret;
+	}
+
+	//create a miscdev that will create a character dev for userland to see the full state.
+	piu->miscdev.minor = MISC_DYNAMIC_MINOR;
+	//name of the /dev/
+	piu->miscdev.name = "piuio_full0";
+	//give all users the ability to read.
+	piu->miscdev.mode = 0444;
+	piu->miscdev.fops = &piu_fops;
+	piu->miscdev.parent = &intf->dev;
+
+	ret = misc_register(&piu->miscdev);
+	if (ret) {
 		return ret;
 	}
 
@@ -643,6 +732,7 @@ static void piuio_disconnect(struct usb_interface *intf)
 	piuio_leds_destroy(piu);
 	input_unregister_device(piu->idev);
 	piuio_destroy(piu);
+	misc_deregister(&piu->miscdev);
 	kfree(piu);
 }
 

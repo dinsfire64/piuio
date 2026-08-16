@@ -1,0 +1,22 @@
+# Kernel build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+
+# Generated kernel module files
+.modules.order
+Module.symvers
+
+# Kernel build directory
+*.cmd
+
+# Temporary/editor files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
